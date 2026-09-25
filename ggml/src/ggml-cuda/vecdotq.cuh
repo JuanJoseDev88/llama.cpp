@@ -680,7 +680,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
     return d6 * sumf_d;
 }
 
-#if defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+#if defined(GGML_USE_HIP)
 // HIP implements __byte_perm as a software routine; these helpers use the hardware byte permute (v_perm_b32) instead and produce the same bytes as the __byte_perm sequences below.
 
 // 16 Q1_0 sign bits -> four ints holding weights 4j..4j+3 as int8 (+1 / -1) in bytes 0..3.
@@ -702,7 +702,36 @@ static __device__ __forceinline__ int q2_0_symbols4_hip(const uint32_t b) {
     const uint32_t z = (y & 0x0303u) | ((y & 0x3030u) << 12);
     return (int) __builtin_amdgcn_perm(0x020100FFu, 0x020100FFu, z);
 }
-#endif  // defined(GGML_USE_HIP) && defined(__HIP_DEVICE_COMPILE__)
+
+// byte_perm(a, b, 0x7531): interleave the high bytes of the two 16-bit-lane words.
+// On HIP this cannot go through __builtin_amdgcn_perm: gfx1030/RDNA2 + ROCm 7.x folds
+// the intrinsic incorrectly whenever the selector is a compile-time constant (verified
+// with a standalone repro), and 0x7531 is a literal at every call site.
+__device__ __forceinline__ int ptq1_0_interleave_hi(const uint32_t a, const uint32_t b) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return (int) (((a >> 8) & 0xFFu) | (((a >> 24) & 0xFFu) << 8) | (((b >> 8) & 0xFFu) << 16) | (((b >> 24) & 0xFFu) << 24));
+#else
+    return (int) __byte_perm(a, b, 0x7531);
+#endif
+}
+
+// widen helpers for the PTQ1_0 decode: byte_perm(x, 0, 0x4140) spreads bytes {0,1}
+// into the low halves of the two 16-bit lanes and byte_perm(x, 0, 0x4342) does the
+// same for bytes {2,3}. One byte per lane lets the *3 ladder run in 16 bits with no
+// cross-carry, while & 0x00FF00FF reproduces the CPU codec's uint8_t mod-256 wrap.
+// Written as plain ALU because ROCm 7.x constant-folds amdgcn_perm on literals.
+
+static __device__ __forceinline__ int ptq1_0_vsub4(const int a, const int b) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    // Borrow-free per-byte subtract (AMD has no __vsub4 and a plain 32-bit subtract
+    // lets borrows cross byte lanes, corrupting the {0,1,2} digit bytes). Both operands
+    // are < 0x80 per byte, so (a|0x80..) - (b&0x7F..) cannot borrow between lanes.
+    return (int) ((((uint32_t) a | 0x80808080u) - ((uint32_t) b & 0x7F7F7F7Fu)) ^ 0x80808080u);
+#else
+    return __vsub4(a, b);
+#endif
+}
+#endif  // defined(GGML_USE_HIP)
 
 static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
@@ -804,7 +833,10 @@ static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
     return d2 * d8 * sumi;
 }
 
-#if !defined(GGML_USE_HIP)
+// The multi-column SIMD dot is not NVIDIA-specific: the decode is integer arithmetic
+// through ptq1_0_interleave_hi/ptq1_0_vsub4 and the dot products go through
+// ggml_cuda_dp4a, which maps onto v_sdot4/v_sudot4 on every AMD target that runs
+// PTQ1_0 at all.
 template <int ncols_dst>
 static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __restrict__ vbq,
                                                                  const block_q8_1 * __restrict__ bq8_1,
@@ -819,8 +851,8 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
 #    pragma unroll
     for (int g = 0; g < 4; ++g) {
         const uint32_t packed = get_int_b4(bq->qs, g);
-        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
-        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+        uint32_t       v_lo   = (packed & 0xFFu) | ((packed & 0xFF00u) << 8);
+        uint32_t       v_hi   = ((packed >> 16) & 0xFFu) | (((packed >> 24) & 0xFFu) << 16);
 
 #    pragma unroll
         for (int t = 0; t < 5; ++t) {
@@ -829,7 +861,7 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
             v_lo                = w_lo & 0x00FF00FF;
             v_hi                = w_hi & 0x00FF00FF;
 
-            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int      q = ptq1_0_vsub4(ptq1_0_interleave_hi(w_lo, w_hi), 0x01010101);
             const int e = t * 16 + 4 * g;
 #    pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
@@ -842,8 +874,8 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
 #    pragma unroll
     for (int g = 0; g < 2; ++g) {
         const uint32_t packed = get_int_b4(bq->qs + 16, g);
-        uint32_t       v_lo   = __byte_perm(packed, 0, 0x4140);
-        uint32_t       v_hi   = __byte_perm(packed, 0, 0x4342);
+        uint32_t       v_lo   = (packed & 0xFFu) | ((packed & 0xFF00u) << 8);
+        uint32_t       v_hi   = ((packed >> 16) & 0xFFu) | (((packed >> 24) & 0xFFu) << 16);
 
 #    pragma unroll
         for (int t = 0; t < 5; ++t) {
@@ -852,7 +884,7 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
             v_lo                = w_lo & 0x00FF00FF;
             v_hi                = w_hi & 0x00FF00FF;
 
-            const int q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+            const int q = ptq1_0_vsub4(ptq1_0_interleave_hi(w_lo, w_hi), 0x01010101);
             const int e = 80 + t * 8 + 4 * g;
 #    pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
@@ -870,7 +902,7 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
         const uint32_t w1 = v * 3;
         v                 = w1 & 0x00FF00FF;
 
-        const int q = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
+        const int q = ptq1_0_vsub4(ptq1_0_interleave_hi(w0, w1), 0x01010101);
 #    pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
             const int u = get_int_b4(bq8_1[j * stride_col_y + iqs + 3].qs, 6 + t / 2);
@@ -889,67 +921,17 @@ static __device__ __forceinline__ void vec_dot_ptq1_0_q8_1_multi(const void * __
         result[j] = d * acc;
     }
 }
-#endif
 
 // PTQ1_0 x Q8_1. One call consumes the full 128-weight block.
 static __device__ __forceinline__ float vec_dot_ptq1_0_q8_1(const void * __restrict__ vbq,
                                                             const block_q8_1 * __restrict__ bq8_1,
                                                             const int & kbx,
                                                             const int & iqs) {
-#if defined(GGML_USE_HIP)
-    const block_ptq1_0 * bq      = (const block_ptq1_0 *) vbq + kbx;
-    int                  sumi[4] = { 0, 0, 0, 0 };
-
-#    pragma unroll
-    for (int m = 0; m < 16; ++m) {
-        uint32_t v = bq->qs[m];
-#    pragma unroll
-        for (int t = 0; t < 5; ++t) {
-            const uint32_t w = v * 3;
-            const int      q = (int) (w >> 8) - 1;
-            v                = w & 0xFF;
-            const int e      = t * 16 + m;
-            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
-        }
-    }
-
-#    pragma unroll
-    for (int m = 0; m < 8; ++m) {
-        uint32_t v = bq->qs[16 + m];
-#    pragma unroll
-        for (int t = 0; t < 5; ++t) {
-            const uint32_t w = v * 3;
-            const int      q = (int) (w >> 8) - 1;
-            v                = w & 0xFF;
-            const int e      = 80 + t * 8 + m;
-            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
-        }
-    }
-
-#    pragma unroll
-    for (int h = 0; h < 2; ++h) {
-        uint32_t v = bq->qh[h];
-#    pragma unroll
-        for (int t = 0; t < 4; ++t) {
-            const uint32_t w = v * 3;
-            const int      q = (int) (w >> 8) - 1;
-            v                = w & 0xFF;
-            const int e      = 120 + t * 2 + h;
-            sumi[e >> 5] += q * (int) bq8_1[iqs + (e >> 5)].qs[e & 31];
-        }
-    }
-
-    float acc = 0.0f;
-#    pragma unroll
-    for (int k = 0; k < 4; ++k) {
-        acc += __low2float(bq8_1[iqs + k].ds) * (float) sumi[k];
-    }
-    return (float) bq->d * acc;
-#else
+    // the same SIMD path on NVIDIA and AMD: the scalar byte-by-byte decode that used to
+    // serve HIP is a large tg regression and, unlike the SIMD dot, it is not bit-identical
     float result;
     vec_dot_ptq1_0_q8_1_multi<1>(vbq, bq8_1, kbx, iqs, 0, &result);
     return result;
-#endif
 }
 
 static __device__ __forceinline__ float vec_dot_pq2_0_q8_1(const void * __restrict__ vbq,

@@ -7,6 +7,16 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q1_0, 512, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
     CASE(GGML_TYPE_Q1_0, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
 
+    // PTQ1_0 uses the same tile geometry as Q1_0: the loader expands to one int8 per weight
+    // and the vec dot is MFMA/dp4a over signed bytes, so register pressure and tile sizes match.
+    CASE(GGML_TYPE_PTQ1_0, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_PTQ1_0, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_PTQ1_0, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_PTQ1_0, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_PTQ1_0, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_PTQ1_0, 512, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_PTQ1_0, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, false);
+
     CASE(GGML_TYPE_Q2_0, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
     CASE(GGML_TYPE_Q2_0, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
     CASE(GGML_TYPE_Q2_0, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);

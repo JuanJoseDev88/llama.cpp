@@ -256,11 +256,40 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-#if !defined(GGML_USE_HIP)
+// The PTQ1_0 tile loader is not NVIDIA-specific: the decode is integer arithmetic and
+// ggml_cuda_dp4a maps onto v_sdot4/v_sudot4 on every AMD target that runs PTQ1_0 at all.
+// byte_perm(a, b, 0x7531): interleave the high bytes of the two 16-bit-lane words.
+// On HIP this cannot go through __builtin_amdgcn_perm: gfx1030/RDNA2 + ROCm 7.x folds
+// the intrinsic incorrectly whenever the selector is a compile-time constant (verified
+// with a standalone repro), and 0x7531 is a literal at every call site.
+static __device__ __forceinline__ int ggml_cuda_mmq_ptq1_0_interleave_hi(const uint32_t a, const uint32_t b) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return (int) (((a >> 8) & 0xFFu) | (((a >> 24) & 0xFFu) << 8) | (((b >> 8) & 0xFFu) << 16) | (((b >> 24) & 0xFFu) << 24));
+#else
+    return (int) __byte_perm(a, b, 0x7531);
+#endif
+}
+
+static __device__ __forceinline__ int ggml_cuda_mmq_ptq1_0_vsub4(const int a, const int b) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    // Borrow-free per-byte subtract (AMD has no __vsub4 and a plain 32-bit subtract
+    // lets borrows cross byte lanes, corrupting the {0,1,2} digit bytes). Both operands
+    // are < 0x80 per byte, so (a|0x80..) - (b&0x7F..) cannot borrow between lanes.
+    return (int) ((((uint32_t) a | 0x80808080u) - ((uint32_t) b & 0x7F7F7F7Fu)) ^ 0x80808080u);
+#else
+    return __vsub4(a, b);
+#endif
+}
+
 static __device__
 __forceinline__ void ggml_cuda_mmq_decode_ptq1_0_qs4(uint32_t packed, int * __restrict__ dst, int stride) {
-    uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
-    uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
+    // widen: byte_perm(x,0,0x4140) spreads bytes {0,1} into the low halves of the two
+    // 16-bit lanes; byte_perm(x,0,0x4342) does the same for bytes {2,3}. One byte per
+    // lane lets the *3 ladder run in 16 bits with no cross-carry, while & 0x00FF00FF
+    // reproduces the CPU codec's uint8_t mod-256 wrap. Plain ALU because ROCm 7.x
+    // constant-folds amdgcn_perm on literals.
+    uint32_t v_lo = (packed & 0xFFu) | ((packed & 0xFF00u) << 8);
+    uint32_t v_hi = ((packed >> 16) & 0xFFu) | (((packed >> 24) & 0xFFu) << 16);
 
 #    pragma unroll
     for (int t = 0; t < 5; ++t) {
@@ -268,7 +297,7 @@ __forceinline__ void ggml_cuda_mmq_decode_ptq1_0_qs4(uint32_t packed, int * __re
         const uint32_t w_hi = v_hi * 3;
         v_lo                = w_lo & 0x00FF00FF;
         v_hi                = w_hi & 0x00FF00FF;
-        dst[t * stride]     = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+        dst[t * stride]     = ggml_cuda_mmq_ptq1_0_vsub4(ggml_cuda_mmq_ptq1_0_interleave_hi(w_lo, w_hi), 0x01010101);
     }
 }
 
@@ -283,7 +312,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
     constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
     constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
 
-#    if defined(TURING_MMA_AVAILABLE)
+#    if defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     int *   x_qs = (int *) x_tile;
     float * x_df = (float *) (x_qs + 2 * MMQ_TILE_NE_K);
 #    else
@@ -322,13 +351,13 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
             ggml_cuda_mmq_decode_ptq1_0_qs4(get_int_b4(bxi->qs + 16, g), row + 20 + g, 2);
         } else if (lane == 6) {
             uint32_t v = (uint32_t) bxi->qh[0] | ((uint32_t) bxi->qh[1] << 16);
-#    pragma unroll
+#pragma unroll
             for (int t = 0; t < 4; t += 2) {
                 const uint32_t w0 = v * 3;
                 v                 = w0 & 0x00FF00FF;
                 const uint32_t w1 = v * 3;
                 v                 = w1 & 0x00FF00FF;
-                row[30 + t / 2]   = __vsub4(__byte_perm(w0, w1, 0x7531), 0x01010101);
+                row[30 + t / 2]   = ggml_cuda_mmq_ptq1_0_vsub4(ggml_cuda_mmq_ptq1_0_interleave_hi(w0, w1), 0x01010101);
             }
         }
     }
@@ -347,14 +376,13 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_ptq1_0(const cha
         }
 
         const block_ptq1_0 * bxi = (const block_ptq1_0 *) x + kbx0 + i * stride + scale_block;
-#    if defined(TURING_MMA_AVAILABLE)
+#    if defined(TURING_MMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_df[i * sram_stride + ksx] = bxi->d;
 #    else
         x_df[i * (2 * MMQ_TILE_NE_K / QI8_0) + i / (QI8_0 / 2) + ksx] = bxi->d;
 #    endif
     }
 }
-#endif
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {

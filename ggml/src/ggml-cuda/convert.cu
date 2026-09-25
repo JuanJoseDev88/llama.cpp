@@ -136,12 +136,41 @@ static __global__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t
     }
 }
 
-#if !defined(GGML_USE_HIP)
+// The PTQ1_0 dequantizer is not NVIDIA-specific: the decode is integer arithmetic and
+// __shfl_sync maps onto the HIP shim, so it compiles the same on every target that
+// runs PTQ1_0 at all. HIP implements __byte_perm/__vsub4 as slow software routines,
+// so route them through the hardware byte permute (v_perm_b32) / plain arithmetic.
+// byte_perm(a, b, 0x7531): interleave the high bytes of the two 16-bit-lane words.
+// On HIP this cannot go through __builtin_amdgcn_perm: gfx1030/RDNA2 + ROCm 7.x folds
+// the intrinsic incorrectly whenever the selector is a compile-time constant (verified
+// with a standalone repro), and 0x7531 is a literal at every call site.
+static __device__ __forceinline__ int ptq1_0_dq_byte_perm(const uint32_t a, const uint32_t b, const uint32_t sel) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    (void) sel; // all call sites use 0x7531
+    return (int) (((a >> 8) & 0xFFu) | (((a >> 24) & 0xFFu) << 8) | (((b >> 8) & 0xFFu) << 16) | (((b >> 24) & 0xFFu) << 24));
+#else
+    return (int) __byte_perm(a, b, sel);
+#endif
+}
+
+static __device__ __forceinline__ int ptq1_0_dq_vsub4(const int a, const int b) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    // Borrow-free per-byte subtract (AMD has no __vsub4 and a plain 32-bit subtract
+    // lets borrows cross byte lanes, corrupting the {0,1,2} digit bytes). Both operands
+    // are < 0x80 per byte, so (a|0x80..) - (b&0x7F..) cannot borrow between lanes.
+    return (int) ((((uint32_t) a | 0x80808080u) - ((uint32_t) b & 0x7F7F7F7Fu)) ^ 0x80808080u);
+#else
+    return __vsub4(a, b);
+#endif
+}
+
 template <typename dst_t>
 static __device__
 __forceinline__ void dequantize_ptq1_0_qs4(uint32_t packed, float d, dst_t * __restrict__ y, int base, int stride) {
-    uint32_t v_lo = __byte_perm(packed, 0, 0x4140);
-    uint32_t v_hi = __byte_perm(packed, 0, 0x4342);
+    // widen: byte_perm(x,0,0x4140)/(x,0,0x4342) spread bytes {0,1}/{2,3} into the low
+    // halves of the two 16-bit lanes (see note in vecdotq.cuh).
+    uint32_t v_lo = (packed & 0xFFu) | ((packed & 0xFF00u) << 8);
+    uint32_t v_hi = ((packed >> 16) & 0xFFu) | (((packed >> 24) & 0xFFu) << 16);
 
 #    pragma unroll
     for (int t = 0; t < 5; ++t) {
@@ -150,7 +179,7 @@ __forceinline__ void dequantize_ptq1_0_qs4(uint32_t packed, float d, dst_t * __r
         v_lo                = w_lo & 0x00FF00FF;
         v_hi                = w_hi & 0x00FF00FF;
 
-        const uint32_t q = __vsub4(__byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
+        const uint32_t q = (uint32_t) ptq1_0_dq_vsub4(ptq1_0_dq_byte_perm(w_lo, w_hi, 0x7531), 0x01010101);
 #    pragma unroll
         for (int b = 0; b < 4; ++b) {
             const int trit           = (int8_t) (q >> (8 * b));
@@ -215,7 +244,6 @@ static void dequantize_row_ptq1_0_cuda(const void * __restrict__ vx,
     const int     num_blocks                  = (nb + quant_blocks_per_cuda_block - 1) / quant_blocks_per_cuda_block;
     dequantize_block_ptq1_0<<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>((const block_ptq1_0 *) vx, y, nb);
 }
-#endif
 
 //================================== k-quants
 
@@ -545,11 +573,7 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
         case GGML_TYPE_PQ2_0:
             return dequantize_block_cont_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
         case GGML_TYPE_PTQ1_0:
-#if !defined(GGML_USE_HIP)
             return dequantize_row_ptq1_0_cuda;
-#else
-            return dequantize_block_cont_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
-#endif
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
@@ -610,11 +634,7 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
         case GGML_TYPE_PQ2_0:
             return dequantize_block_cont_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
         case GGML_TYPE_PTQ1_0:
-#if !defined(GGML_USE_HIP)
             return dequantize_row_ptq1_0_cuda;
-#else
-            return dequantize_block_cont_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
-#endif
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
@@ -678,11 +698,7 @@ to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type) {
         case GGML_TYPE_PQ2_0:
             return dequantize_block_cont_cuda<QK_PQ2_0, QR_PQ2_0, dequantize_pq2_0>;
         case GGML_TYPE_PTQ1_0:
-#if !defined(GGML_USE_HIP)
             return dequantize_row_ptq1_0_cuda;
-#else
-            return dequantize_block_cont_cuda<QK_PTQ1_0, QR_PTQ1_0, dequantize_ptq1_0>;
-#endif
         case GGML_TYPE_Q4_0:
             return dequantize_row_q4_0_cuda;
         case GGML_TYPE_Q4_1:
