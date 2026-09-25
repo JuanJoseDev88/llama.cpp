@@ -14,6 +14,38 @@
 > **Speculative decoding (dspark)** is supported via mainline's draft-dspark plus fork patches. Drafters published for older model releases need a one-time conversion with `gguf-dspark-to-dflash` (see [SPECULATIVE.md](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/SPECULATIVE.md) in Bonsai-demo); newer releases ship ready-to-use drafters.
 >
 > Do NOT build from `prism-v6` (stale mid-migration snapshot) and do NOT mix this fork's `ggml-*` libraries with a stock llama.cpp build.
+>
+> **AMD / RDNA (HIP):** branch `amd-ptq1_0` enables the native PTQ1_0 kernels on AMD GPUs: +82% decode and +25% prompt processing on an RX 6700 XT. Details in [AMD / ROCm (RDNA)](#amd--rocm-rdna).
+
+## AMD / ROCm (RDNA)
+
+The PTQ1_0 (1.75-bit ternary) fast paths were gated off on HIP and fell back to
+dequant + hipBLAS. Branch `amd-ptq1_0` turns them on and tunes them for RDNA:
+
+- **Native kernels:** dedicated decode mat-vec (`ggml/src/ggml-cuda/mmvq-ptq1_0.cuh`),
+  PTQ1_0 MMQ prefill tiles with RDNA2 / RDNA3 / RDNA3.5 / RDNA4 / CDNA configs, and the
+  dedicated PT mat-vec - all un-gated for HIP and checked against the CPU reference.
+- **Decode tuning:** one row per work item, a live-range fence on the gate path, and
+  `v_perm_b32` trit decode with byte-granular selectors. AMD `v_perm_b32` indexes whole
+  bytes while CUDA `__byte_perm` indexes nibbles - a leaked nibble selector silently
+  produces garbage weights. The verified selector constants live in `mmvq-ptq1_0.cuh`.
+
+Measured on an RX 6700 XT (gfx1030, ROCm 7.2.3) with `Ternary-Bonsai-2-27B-PTQ1_0.gguf`:
+
+| | dequant + hipBLAS fallback | native kernels | + decode tuning |
+|---|---:|---:|---:|
+| tg128 decode | ~20 t/s | 30.5 t/s | **37.0 t/s** |
+| pp512 prompt | ~200 t/s | 256 t/s | 256 t/s |
+
+Fallback figures are from `llama-server` logs; kernel figures from
+`llama-bench -n 128 -r 3`. The tuned decode also holds 37.0 t/s at 15.6k context
+(`-p 15360`), streams ~87% of the card's measured bandwidth (301 of 347 GB/s), and
+leaves prompt processing untouched (235.3 -> 235.1 t/s at pp15360, the measurement
+control). Every step was gated on `test-backend-ops -o MUL_MAT -p ".*ptq1_0.*"` plus a
+greedy generation check.
+
+Build with ROCm (`-DGGML_CUDA=ON`); on a 6700 XT you may need
+`HSA_OVERRIDE_GFX_VERSION=10.3.0`.
 
 ---
 
