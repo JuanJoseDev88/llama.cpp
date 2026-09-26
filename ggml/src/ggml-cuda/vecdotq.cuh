@@ -704,9 +704,9 @@ static __device__ __forceinline__ int q2_0_symbols4_hip(const uint32_t b) {
 }
 
 // byte_perm(a, b, 0x7531): interleave the high bytes of the two 16-bit-lane words.
-// On HIP this cannot go through __builtin_amdgcn_perm: gfx1030/RDNA2 + ROCm 7.x folds
-// the intrinsic incorrectly whenever the selector is a compile-time constant (verified
-// with a standalone repro), and 0x7531 is a literal at every call site.
+// On HIP emit the ALU form below: v_perm_b32/amdgcn_perm is byte granular, so it reads
+// 0x7531 as bytes {0x31,0x75,0,0} (two out of range -> 0xff) where __byte_perm reads
+// nibbles {1,3,5,7}. A runtime selector returns the same bytes.
 __device__ __forceinline__ int ptq1_0_interleave_hi(const uint32_t a, const uint32_t b) {
 #if defined(__HIP_DEVICE_COMPILE__)
     return (int) (((a >> 8) & 0xFFu) | (((a >> 24) & 0xFFu) << 8) | (((b >> 8) & 0xFFu) << 16) | (((b >> 24) & 0xFFu) << 24));
@@ -719,7 +719,7 @@ __device__ __forceinline__ int ptq1_0_interleave_hi(const uint32_t a, const uint
 // into the low halves of the two 16-bit lanes and byte_perm(x, 0, 0x4342) does the
 // same for bytes {2,3}. One byte per lane lets the *3 ladder run in 16 bits with no
 // cross-carry, while & 0x00FF00FF reproduces the CPU codec's uint8_t mod-256 wrap.
-// Written as plain ALU because ROCm 7.x constant-folds amdgcn_perm on literals.
+// Plain ALU on HIP: 0x4140/0x4342 are CUDA nibble selectors, see ptq1_0_interleave_hi above.
 
 static __device__ __forceinline__ int ptq1_0_vsub4(const int a, const int b) {
 #if defined(__HIP_DEVICE_COMPILE__)

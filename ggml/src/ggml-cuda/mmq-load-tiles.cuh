@@ -259,9 +259,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 // The PTQ1_0 tile loader is not NVIDIA-specific: the decode is integer arithmetic and
 // ggml_cuda_dp4a maps onto v_sdot4/v_sudot4 on every AMD target that runs PTQ1_0 at all.
 // byte_perm(a, b, 0x7531): interleave the high bytes of the two 16-bit-lane words.
-// On HIP this cannot go through __builtin_amdgcn_perm: gfx1030/RDNA2 + ROCm 7.x folds
-// the intrinsic incorrectly whenever the selector is a compile-time constant (verified
-// with a standalone repro), and 0x7531 is a literal at every call site.
+// On HIP emit the ALU form below: v_perm_b32/amdgcn_perm is byte granular, so it reads
+// 0x7531 as bytes {0x31,0x75,0,0} (two out of range -> 0xff) where __byte_perm reads
+// nibbles {1,3,5,7}. A runtime selector returns the same bytes.
 static __device__ __forceinline__ int ggml_cuda_mmq_ptq1_0_interleave_hi(const uint32_t a, const uint32_t b) {
 #if defined(__HIP_DEVICE_COMPILE__)
     return (int) (((a >> 8) & 0xFFu) | (((a >> 24) & 0xFFu) << 8) | (((b >> 8) & 0xFFu) << 16) | (((b >> 24) & 0xFFu) << 24));
@@ -286,8 +286,8 @@ __forceinline__ void ggml_cuda_mmq_decode_ptq1_0_qs4(uint32_t packed, int * __re
     // widen: byte_perm(x,0,0x4140) spreads bytes {0,1} into the low halves of the two
     // 16-bit lanes; byte_perm(x,0,0x4342) does the same for bytes {2,3}. One byte per
     // lane lets the *3 ladder run in 16 bits with no cross-carry, while & 0x00FF00FF
-    // reproduces the CPU codec's uint8_t mod-256 wrap. Plain ALU because ROCm 7.x
-    // constant-folds amdgcn_perm on literals.
+    // reproduces the CPU codec's uint8_t mod-256 wrap. Plain ALU because 0x4140/0x4342
+    // are CUDA nibble selectors, see ggml_cuda_mmq_ptq1_0_interleave_hi above.
     uint32_t v_lo = (packed & 0xFFu) | ((packed & 0xFF00u) << 8);
     uint32_t v_hi = ((packed >> 16) & 0xFFu) | (((packed >> 24) & 0xFFu) << 16);
 

@@ -139,11 +139,11 @@ static __global__ void dequantize_block_q4_1(const void * __restrict__ vx, dst_t
 // The PTQ1_0 dequantizer is not NVIDIA-specific: the decode is integer arithmetic and
 // __shfl_sync maps onto the HIP shim, so it compiles the same on every target that
 // runs PTQ1_0 at all. HIP implements __byte_perm/__vsub4 as slow software routines,
-// so route them through the hardware byte permute (v_perm_b32) / plain arithmetic.
+// so the HIP branch of each helper is plain arithmetic.
 // byte_perm(a, b, 0x7531): interleave the high bytes of the two 16-bit-lane words.
-// On HIP this cannot go through __builtin_amdgcn_perm: gfx1030/RDNA2 + ROCm 7.x folds
-// the intrinsic incorrectly whenever the selector is a compile-time constant (verified
-// with a standalone repro), and 0x7531 is a literal at every call site.
+// v_perm_b32/amdgcn_perm is byte granular, so it reads 0x7531 as bytes {0x31,0x75,0,0}
+// (two out of range -> 0xff) where __byte_perm reads nibbles {1,3,5,7}. A runtime
+// selector returns the same bytes.
 static __device__ __forceinline__ int ptq1_0_dq_byte_perm(const uint32_t a, const uint32_t b, const uint32_t sel) {
 #if defined(__HIP_DEVICE_COMPILE__)
     (void) sel; // all call sites use 0x7531
