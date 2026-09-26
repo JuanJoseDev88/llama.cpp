@@ -965,10 +965,12 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
                 tile_y[l] = by0[l];
             }
-        }        __syncthreads();
+        }
+
+        __syncthreads();
 
         if constexpr (async_buffer_y) {
-            const char * by1 = reinterpret_cast<const char*>(
+            const char * by1 = reinterpret_cast<const char *>(
                 y + ncols_y * ((kb0 * qk / ne_block) * sz + sz));
             char * tile_y_next_bytes = reinterpret_cast<char *>(tile_y_next);
             const int tid = threadIdx.y*warp_size + threadIdx.x;

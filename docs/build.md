@@ -397,7 +397,7 @@ If your GPU is not officially supported you can use the environment variable [`H
 
 ### Runtime notes and profiling
 
-- The PTQ1_0 ternary kernels (decode mat-vec, MMQ prefill, PT mat-vec) have native HIP paths in this fork; measured numbers on an RX 6700 XT are in the top-level [README](../README.md#amd--rocm-rdna).
+- The PTQ1_0 ternary kernels (decode mat-vec, MMQ prefill, PT mat-vec) have native HIP paths in this fork. What the branch changes and the measured numbers on an RX 6700 XT: [PTQ1_0 on AMD RDNA](ptq1_0-rdna.md).
 - CUDA graph capture is enabled on HIP builds as well (`GGML_HIP_GRAPHS=ON` by default) and is worth ~6 % decode throughput on the PTQ1_0 model, so leave it on when benchmarking. Set `GGML_CUDA_DISABLE_GRAPHS=1` to turn it off, for example when tracing or debugging kernels.
 - Per-kernel timings come from ROCm's profiler: `/opt/rocm/bin/rocprofv3 --kernel-trace <command>`. Performance counter collection (`--pmc`) has been observed to hang RDNA2 GPUs on ROCm 7.x, prefer `--kernel-trace`.
 - Validate a fresh build with `./build/bin/test-backend-ops` before trusting any benchmark. Every op must pass on all available backends.

@@ -19,10 +19,15 @@
 
 ## AMD / ROCm (RDNA)
 
-The PTQ1_0 (1.75-bit ternary) fast paths were gated off on HIP and fell back to dequant + hipBLAS. Branch `amd-ptq1_0` turns them on and tunes them for RDNA:
+PTQ1_0 (1.75-bit ternary) had no fast path on HIP: prompt processing always fell back to fp16 dequantize + hipBLAS and decode ran a generic single-column kernel. Branch `amd-ptq1_0` adds the missing kernels, un-gates them for AMD and tunes the decode loop for RDNA.
 
-- **Native kernels:** dedicated decode mat-vec (`ggml/src/ggml-cuda/mmvq-ptq1_0.cuh`), PTQ1_0 MMQ prefill tiles with RDNA2 / RDNA3 / RDNA3.5 / RDNA4 / CDNA configs, and the dedicated PT mat-vec - all un-gated for HIP and checked against the CPU reference.
-- **Decode tuning:** one row per work item, a live-range fence on the gate path, and `v_perm_b32` trit decode with byte-granular selectors. AMD `v_perm_b32` indexes whole bytes while CUDA `__byte_perm` indexes nibbles - a leaked nibble selector silently produces garbage weights. The verified selector constants live in `mmvq-ptq1_0.cuh`.
+- **Prefill:** a PTQ1_0 MMQ tile loader plus tile geometries for RDNA2, RDNA3, RDNA3.5, RDNA4 and CDNA. The tiles need no NVIDIA-only instruction, so `mmq_supported` no longer depends on a tensor core.
+- **Decode:** a dedicated mat-vec kernel that reads a planar-transposed Q8_1 activation layout and shares the weight decode across all column counts, wired into the scalar, multi-column, gated and MoE paths.
+- **RDNA tuning:** one row per work item, a live-range fence on the gated dot and hardware `v_perm_b32` with byte selectors take decode from 30.5 to 37.0 t/s.
+
+What the branch changes, the byte-vs-nibble permute trap that silently decodes garbage weights, and the gate to validate any change: [docs/ptq1_0-rdna.md](docs/ptq1_0-rdna.md).
+
+### Measurements
 
 Measured on an RX 6700 XT (gfx1030, ROCm 7.2.3) with `Ternary-Bonsai-2-27B-PTQ1_0.gguf`:
 
