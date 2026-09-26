@@ -395,6 +395,14 @@ You can download it from your Linux distro's package manager or from here: [ROCm
 The environment variable [`HIP_VISIBLE_DEVICES`](https://rocm.docs.amd.com/en/latest/understand/gpu_isolation.html#hip-visible-devices) can be used to specify which GPU(s) will be used.
 If your GPU is not officially supported you can use the environment variable [`HSA_OVERRIDE_GFX_VERSION`] set to a similar GPU, for example 10.3.0 on RDNA2 (e.g. gfx1030, gfx1031, or gfx1035) or 11.0.0 on RDNA3. Note that [`HSA_OVERRIDE_GFX_VERSION`] is [not supported on Windows](https://github.com/ROCm/ROCm/issues/2654)
 
+### Runtime notes and profiling
+
+- The PTQ1_0 ternary kernels (decode mat-vec, MMQ prefill, PT mat-vec) have native HIP paths in this fork; measured numbers on an RX 6700 XT are in the top-level [README](../README.md#amd--rocm-rdna).
+- CUDA graph capture is also enabled on HIP builds. Set `GGML_CUDA_DISABLE_GRAPHS=1` to turn it off, for example when tracing or debugging kernels.
+- Per-kernel timings come from ROCm's profiler: `/opt/rocm/bin/rocprofv3 --kernel-trace <command>`. Performance counter collection (`--pmc`) has been observed to hang RDNA2 GPUs on ROCm 7.x, prefer `--kernel-trace`.
+- Validate a fresh build with `./build/bin/test-backend-ops` before trusting any benchmark. Every op must pass on all available backends.
+- Known-good combination: ROCm 7.2.3, Radeon RX 6700 XT (gfx1031), `-DGGML_HIP=ON -DGPU_TARGETS=gfx1030 -DCMAKE_BUILD_TYPE=Release`, run with `HSA_OVERRIDE_GFX_VERSION=10.3.0`.
+
 ### Unified Memory
 
 On Linux it is possible to use unified memory architecture (UMA) to share main memory between the CPU and integrated GPU by setting environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1`. However, this hurts performance for non-integrated GPUs (but enables working with integrated GPUs).
